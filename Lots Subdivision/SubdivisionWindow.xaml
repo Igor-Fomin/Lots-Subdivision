@@ -43,18 +43,16 @@
 
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
             <StackPanel>
-                <!-- Selection Group -->
                 <Border BorderBrush="#333333" BorderThickness="1" Padding="15" CornerRadius="4" Margin="0,0,0,20">
                     <StackPanel>
                         <TextBlock Text="CAD SELECTION" FontWeight="Bold" Foreground="#007ACC" Margin="0,0,0,10"/>
                         <Button x:Name="BtnPickParent" Content="Pick Parent Parcel" Click="BtnPickParent_Click" Margin="0,0,0,5"/>
                         <Button x:Name="BtnPickFrontage" Content="Pick Frontage Segment" Click="BtnPickFrontage_Click" Margin="0,0,0,5"/>
-                        <Button x:Name="BtnPickAngle" Content="Pick Side Boundary Angle" Click="BtnPickAngle_Click"/>
+                        <Button x:Name="BtnPickAngle" Content="Pick Side Angle (2 Points)" Click="BtnPickAngle_Click"/>
                         <TextBlock x:Name="TxtStatus" Text="Ready" Foreground="#66BB66" Margin="0,10,0,0" HorizontalAlignment="Center"/>
                     </StackPanel>
                 </Border>
 
-                <!-- Constraint Locking -->
                 <TextBlock Text="CONSTRAINT LOCKING" FontWeight="Bold" Foreground="#007ACC" Margin="0,0,0,5"/>
                 <Grid>
                     <Grid.ColumnDefinitions>
@@ -67,7 +65,6 @@
                     <CheckBox x:Name="ChkLockDepth" Content="Lock Depth" Grid.Column="2"/>
                 </Grid>
 
-                <!-- Parameters -->
                 <TextBlock Text="Target Area (m²)"/>
                 <TextBox x:Name="TxtArea" Text="450.0"/>
 

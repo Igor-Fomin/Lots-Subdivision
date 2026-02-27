@@ -51,10 +51,10 @@ namespace Lots_Subdivision
 
         private void SaveSettings()
         {
-            SubdivisionSettings.TargetArea = double.Parse(TxtArea.Text);
-            SubdivisionSettings.Width = double.Parse(TxtWidth.Text);
-            SubdivisionSettings.Depth = double.Parse(TxtDepth.Text);
-            SubdivisionSettings.Angle = double.Parse(TxtAngle.Text);
+            if (double.TryParse(TxtArea.Text, out double a)) SubdivisionSettings.TargetArea = a;
+            if (double.TryParse(TxtWidth.Text, out double w)) SubdivisionSettings.Width = w;
+            if (double.TryParse(TxtDepth.Text, out double d)) SubdivisionSettings.Depth = d;
+            if (double.TryParse(TxtAngle.Text, out double an)) SubdivisionSettings.Angle = an;
             SubdivisionSettings.LockArea = ChkLockArea.IsChecked ?? false;
             SubdivisionSettings.LockWidth = ChkLockWidth.IsChecked ?? false;
             SubdivisionSettings.LockDepth = ChkLockDepth.IsChecked ?? false;
@@ -79,6 +79,7 @@ namespace Lots_Subdivision
             this.Hide();
             OnPickAngle?.Invoke(this, EventArgs.Empty);
             this.Show();
+            TxtAngle.Text = SubdivisionSettings.Angle.ToString("F2");
         }
 
         private void BtnRun_Click(object sender, RoutedEventArgs e)
@@ -98,12 +99,14 @@ namespace Lots_Subdivision
                 };
                 OnExecute?.Invoke(data);
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Please check your numeric inputs.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-            }
+            catch { MessageBox.Show("Please check your numeric inputs."); }
         }
 
         public void UpdateStatus(string status) => TxtStatus.Text = status;
+
+        public void UpdateAngleDisplay(double angleDegrees)
+        {
+            TxtAngle.Text = angleDegrees.ToString("F2");
+        }
     }
 }

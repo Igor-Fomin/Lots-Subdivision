@@ -82,7 +82,7 @@ namespace Lots_Subdivision
                     int idx = (int)Math.Floor(param);
                     
                     _frontageLine = new Autodesk.AutoCAD.DatabaseServices.Line(pline.GetPoint3dAt(idx), pline.GetPoint3dAt((idx + 1) % pline.NumberOfVertices));
-                    _win?.UpdateStatus("Frontage Ready: " + _frontageLine.Length.ToString("F2") + "m");
+                    _win?.UpdateStatus("Frontage Ready");
                     tr.Commit();
                 }
             }
@@ -91,13 +91,32 @@ namespace Lots_Subdivision
         private void PickAngle()
         {
             var ed = Application.DocumentManager.MdiActiveDocument.Editor;
-            PromptAngleOptions pao = new PromptAngleOptions("\nPick or Enter Side Boundary Angle:");
-            var par = ed.GetAngle(pao);
-            if (par.Status == PromptStatus.OK)
+            PromptPointOptions ppo1 = new PromptPointOptions("\nPick first point for side angle:");
+            var ppr1 = ed.GetPoint(ppo1);
+            if (ppr1.Status != PromptStatus.OK) return;
+
+            PromptPointOptions ppo2 = new PromptPointOptions("\nPick second point for side angle:");
+            ppo2.BasePoint = ppr1.Value;
+            ppo2.UseBasePoint = true;
+            var ppr2 = ed.GetPoint(ppo2);
+            if (ppr2.Status != PromptStatus.OK) return;
+
+            Vector3d v = ppr2.Value - ppr1.Value;
+            double angDeg = 0;
+            if (_frontageLine != null)
             {
-                SubdivisionSettings.Angle = par.Value * (180.0 / Math.PI);
-                _win?.UpdateStatus("Angle Updated");
+                Vector3d fv = _frontageLine.EndPoint - _frontageLine.StartPoint;
+                double ang = fv.GetAngleTo(v, Vector3d.ZAxis);
+                angDeg = ang * (180.0 / Math.PI);
             }
+            else
+            {
+                angDeg = Math.Atan2(v.Y, v.X) * (180.0 / Math.PI);
+            }
+            
+            SubdivisionSettings.Angle = angDeg;
+            _win?.UpdateAngleDisplay(angDeg); // Sync to UI
+            _win?.UpdateStatus("Angle Updated");
         }
 
         private void ExecuteSubdivision(SubdivisionWindow.SubdivisionData data)
@@ -119,26 +138,27 @@ namespace Lots_Subdivision
                     var parentRegion = CreateRegionFromPolyline(parentPline);
                     if (parentRegion == null) return;
 
-                    // Automatic Direction Logic: Use pick point relative to frontage
+                    // Initial side vector
                     Vector3d frontageDir = (_frontageLine.EndPoint - _frontageLine.StartPoint).GetNormal();
                     Vector3d sideVec = frontageDir.RotateBy(data.Angle, Vector3d.ZAxis);
                     
-                    // Flip direction if pick point is on the other side
+                    // Direction Sensing Logic: Flip if pick point is on opposite side
                     Point3d midFrontage = _frontageLine.StartPoint + (frontageDir * (_frontageLine.Length / 2.0));
                     Vector3d toPick = (_pickPt - midFrontage).GetNormal();
                     if (toPick.DotProduct(sideVec) < 0) sideVec = -sideVec;
 
                     Autodesk.AutoCAD.DatabaseServices.Region? resultRegion = null;
                     
-                    // Solver Logic based on Locking
-                    if (data.LockWidth && data.LockDepth) { /* Fixed Box */ }
-                    else if (data.LockWidth) 
+                    // Run Solver
+                    if (data.LockWidth) SolveForDepth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
+                    else SolveForWidth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
+
+                    // Debug/Fallback: If no area (outside), flip and retry once
+                    if (resultRegion == null || resultRegion.Area < 0.001)
                     {
-                        SolveForDepth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
-                    }
-                    else // Default: solve for Width (Frontage)
-                    {
-                        SolveForWidth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
+                        sideVec = -sideVec;
+                        if (data.LockWidth) SolveForDepth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
+                        else SolveForWidth(parentRegion, _frontageLine, data, sideVec, out resultRegion);
                     }
 
                     if (resultRegion != null && resultRegion.Area > 0)
@@ -147,16 +167,20 @@ namespace Lots_Subdivision
                         using (var lotClone = (Autodesk.AutoCAD.DatabaseServices.Region)resultRegion.Clone())
                             parentRegion.BooleanOperation(BooleanOperationType.BoolSubtract, lotClone);
 
-                        // Visual Update: Delete old polyline, create new one
+                        // Visual Update: Replace old boundary with new remaining boundary
                         UpdateParentPolyline(parentPline, parentRegion, tr, db);
                         
                         // Finalize the new lot
                         FinalizeLot(db, tr, resultRegion, ed);
+                        ed.WriteMessage("\nLot created and parent parcel updated.");
+                    }
+                    else
+                    {
+                        ed.WriteMessage("\nError: Could not calculate area inside the parcel.");
                     }
                     
                     parentRegion.Dispose();
                     tr.Commit();
-                    ed.WriteMessage("\nSubdivision complete.");
                 } catch (System.Exception ex) {
                     ed.WriteMessage("\nError: " + ex.Message);
                     tr.Abort();
@@ -172,7 +196,7 @@ namespace Lots_Subdivision
             for (int i = 0; i < 100; i++)
             {
                 if (res != null) res.Dispose();
-                res = CreateClippedRegion(parent, frontage, cur, data.Depth, data.Angle, sideVec);
+                res = CreateClippedRegion(parent, frontage, cur, data.Depth, sideVec);
                 if (Math.Abs(res.Area - data.TargetArea) < 0.001) break;
                 if (res.Area < data.TargetArea) min = cur; else max = cur;
                 cur = (min + max) / 2;
@@ -181,25 +205,25 @@ namespace Lots_Subdivision
 
         private void SolveForDepth(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, SubdivisionWindow.SubdivisionData data, Vector3d sideVec, out Autodesk.AutoCAD.DatabaseServices.Region? res)
         {
-            double min = 0; double max = parent.GeometricExtents.MaxPoint.DistanceTo(parent.GeometricExtents.MinPoint);
+            double min = 0; double max = parent.GeometricExtents.MaxPoint.DistanceTo(parent.GeometricExtents.MinPoint) * 5;
             double cur = (min + max) / 2;
             res = null;
             for (int i = 0; i < 100; i++)
             {
                 if (res != null) res.Dispose();
-                res = CreateClippedRegion(parent, frontage, data.Width, cur, data.Angle, sideVec);
+                res = CreateClippedRegion(parent, frontage, data.Width, cur, sideVec);
                 if (Math.Abs(res.Area - data.TargetArea) < 0.001) break;
                 if (res.Area < data.TargetArea) min = cur; else max = cur;
                 cur = (min + max) / 2;
             }
         }
 
-        private Autodesk.AutoCAD.DatabaseServices.Region CreateClippedRegion(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, double width, double depth, double angle, Vector3d sideVec)
+        private Autodesk.AutoCAD.DatabaseServices.Region CreateClippedRegion(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, double w, double d, Vector3d side)
         {
             Point3d p1 = frontage.StartPoint;
-            Point3d p2 = p1 + (frontage.EndPoint - p1).GetNormal() * width;
-            Point3d p3 = p2 + (sideVec * depth);
-            Point3d p4 = p1 + (sideVec * depth);
+            Point3d p2 = p1 + (frontage.EndPoint - p1).GetNormal() * w;
+            Point3d p3 = p2 + (side * d);
+            Point3d p4 = p1 + (side * d);
 
             using (var box = new Autodesk.AutoCAD.DatabaseServices.Polyline(4))
             {
@@ -211,10 +235,7 @@ namespace Lots_Subdivision
                 using (var br = CreateRegionFromPolyline(box))
                 {
                     Autodesk.AutoCAD.DatabaseServices.Region res = (Autodesk.AutoCAD.DatabaseServices.Region)parent.Clone();
-                    if (br != null) {
-                        res.BooleanOperation(BooleanOperationType.BoolIntersect, br);
-                        br.Dispose();
-                    }
+                    if (br != null) { res.BooleanOperation(BooleanOperationType.BoolIntersect, br); br.Dispose(); }
                     return res;
                 }
             }
@@ -235,12 +256,11 @@ namespace Lots_Subdivision
                         newPline.Layer = oldPline.Layer;
                         btr.AppendEntity(newPline);
                         tr.AddNewlyCreatedDBObject(newPline, true);
-                        _parentId = newPline.ObjectId; // Update global parent ID for next cut
+                        _parentId = newPline.ObjectId; // Automatically update for next cut
                     }
                     else obj.Dispose();
                 }
-                oldPline.UpgradeOpen();
-                oldPline.Erase();
+                oldPline.UpgradeOpen(); oldPline.Erase();
             }
         }
 
@@ -277,9 +297,7 @@ namespace Lots_Subdivision
                         double len = curve.GetDistanceAtParameter(curve.EndParam) - curve.GetDistanceAtParameter(curve.StartParam);
                         using (AlignedDimension dim = new AlignedDimension(curve.StartPoint, curve.EndPoint, curve.GetPointAtDist(len/2), "", db.Dimstyle))
                         {
-                            dim.Layer = textLayer;
-                            btr.AppendEntity(dim);
-                            tr.AddNewlyCreatedDBObject(dim, true);
+                            dim.Layer = textLayer; btr.AppendEntity(dim); tr.AddNewlyCreatedDBObject(dim, true);
                         }
                     }
                     obj.Dispose();
