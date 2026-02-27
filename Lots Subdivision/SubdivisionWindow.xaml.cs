@@ -79,7 +79,6 @@ namespace Lots_Subdivision
             this.Hide();
             OnPickAngle?.Invoke(this, EventArgs.Empty);
             this.Show();
-            TxtAngle.Text = SubdivisionSettings.Angle.ToString("F2");
         }
 
         private void BtnRun_Click(object sender, RoutedEventArgs e)
@@ -102,11 +101,14 @@ namespace Lots_Subdivision
             catch { MessageBox.Show("Please check your numeric inputs."); }
         }
 
-        public void UpdateStatus(string status) => TxtStatus.Text = status;
+        public void UpdateStatus(string status)
+        {
+            Dispatcher.Invoke(() => TxtStatus.Text = status);
+        }
 
         public void UpdateAngleDisplay(double angleDegrees)
         {
-            TxtAngle.Text = angleDegrees.ToString("F2");
+            Dispatcher.Invoke(() => TxtAngle.Text = angleDegrees.ToString("F2"));
         }
     }
 }
