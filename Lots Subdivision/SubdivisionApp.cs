@@ -15,8 +15,9 @@ namespace Lots_Subdivision
     public class SubdivisionState
     {
         public ObjectId ParentId { get; set; } = ObjectId.Null;
-        public Autodesk.AutoCAD.DatabaseServices.Line? FrontageLine { get; set; }
-        public Point3d PickPt { get; set; }
+        public Autodesk.AutoCAD.DatabaseServices.Polyline? FrontagePath { get; set; }
+        public Point3d StartPt { get; set; }
+        public Point3d EndPt { get; set; }
     }
 
     public class SubdivisionApp : IExtensionApplication
@@ -26,8 +27,6 @@ namespace Lots_Subdivision
 
         public void Initialize()
         {
-            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
-            ed.WriteMessage("\nSmart Subdivision Pro v5.0 Loaded. Type 'SubdivideUI' to start.");
         }
 
         public void Terminate() { }
@@ -82,24 +81,95 @@ namespace Lots_Subdivision
             if (state.ParentId.IsNull) { PickParent(); return; }
             
             var ed = Application.DocumentManager.MdiActiveDocument.Editor;
-            PromptPointOptions ppo = new PromptPointOptions("\nPick Frontage Segment on Polyline:");
-            var ppr = ed.GetPoint(ppo);
             
-            if (ppr.Status == PromptStatus.OK)
+            PromptPointOptions ppo1 = new PromptPointOptions("\nPick Frontage START Point on Polyline:");
+            var ppr1 = ed.GetPoint(ppo1);
+            if (ppr1.Status != PromptStatus.OK) return;
+
+            PromptPointOptions ppo2 = new PromptPointOptions("\nPick Frontage END Point on Polyline:");
+            var ppr2 = ed.GetPoint(ppo2);
+            if (ppr2.Status != PromptStatus.OK) return;
+
+            state.StartPt = ppr1.Value.TransformBy(ed.CurrentUserCoordinateSystem);
+            state.EndPt = ppr2.Value.TransformBy(ed.CurrentUserCoordinateSystem);
+
+            using (var tr = state.ParentId.Database.TransactionManager.StartTransaction())
             {
-                state.PickPt = ppr.Value.TransformBy(ed.CurrentUserCoordinateSystem);
-                using (var tr = state.ParentId.Database.TransactionManager.StartTransaction())
+                var pline = (Autodesk.AutoCAD.DatabaseServices.Polyline)tr.GetObject(state.ParentId, OpenMode.ForRead);
+                
+                double startParam = pline.GetParameterAtPoint(pline.GetClosestPointTo(state.StartPt, false));
+                double endParam = pline.GetParameterAtPoint(pline.GetClosestPointTo(state.EndPt, false));
+
+                if (startParam > endParam)
                 {
-                    var pline = (Autodesk.AutoCAD.DatabaseServices.Polyline)tr.GetObject(state.ParentId, OpenMode.ForRead);
-                    Point3d closest = pline.GetClosestPointTo(state.PickPt, false);
-                    double param = pline.GetParameterAtPoint(closest);
-                    int idx = (int)Math.Floor(param);
-                    
-                    state.FrontageLine = new Autodesk.AutoCAD.DatabaseServices.Line(pline.GetPoint3dAt(idx), pline.GetPoint3dAt((idx + 1) % pline.NumberOfVertices));
-                    _win?.UpdateStatus("Frontage Ready");
-                    tr.Commit();
+                    double temp = startParam;
+                    startParam = endParam;
+                    endParam = temp;
                 }
+
+                state.FrontagePath = ExtractSubPolyline(pline, startParam, endParam);
+                _win?.UpdateStatus("Frontage Ready");
+                tr.Commit();
             }
+        }
+
+        private Autodesk.AutoCAD.DatabaseServices.Polyline ExtractSubPolyline(Autodesk.AutoCAD.DatabaseServices.Polyline source, double startParam, double endParam)
+        {
+            Autodesk.AutoCAD.DatabaseServices.Polyline sub = new Autodesk.AutoCAD.DatabaseServices.Polyline();
+            int startIndex = (int)Math.Floor(startParam);
+            int endIndex = (int)Math.Floor(endParam);
+
+            int vCount = 0;
+
+            Func<double, Point2d> getPt = (p) => {
+                Point3d p3 = source.GetPointAtParameter(p);
+                return new Point2d(p3.X, p3.Y);
+            };
+
+            if (startIndex == endIndex)
+            {
+                // Both points on the same segment
+                double b = source.GetBulgeAt(startIndex);
+                double newBulge = 0;
+                if (b != 0)
+                {
+                    double sweep = 4.0 * Math.Atan(b);
+                    newBulge = Math.Tan(sweep * (endParam - startParam) / 4.0);
+                }
+                sub.AddVertexAt(vCount++, getPt(startParam), newBulge, 0, 0);
+                sub.AddVertexAt(vCount++, getPt(endParam), 0, 0, 0);
+            }
+            else
+            {
+                // Start segment
+                double bStart = source.GetBulgeAt(startIndex);
+                double startBulge = 0;
+                if (bStart != 0)
+                {
+                    double sweep = 4.0 * Math.Atan(bStart);
+                    startBulge = Math.Tan(sweep * (1.0 - (startParam - startIndex)) / 4.0);
+                }
+                sub.AddVertexAt(vCount++, getPt(startParam), startBulge, 0, 0);
+
+                // Full segments in between
+                for (int i = startIndex + 1; i < endIndex; i++)
+                {
+                    sub.AddVertexAt(vCount++, source.GetPoint2dAt(i), source.GetBulgeAt(i), 0, 0);
+                }
+
+                // End segment
+                double bEnd = source.GetBulgeAt(endIndex);
+                double endBulge = 0;
+                if (bEnd != 0 && endParam > endIndex)
+                {
+                    double sweep = 4.0 * Math.Atan(bEnd);
+                    endBulge = Math.Tan(sweep * (endParam - endIndex) / 4.0);
+                }
+                sub.AddVertexAt(vCount++, source.GetPoint2dAt(endIndex), endBulge, 0, 0);
+                sub.AddVertexAt(vCount++, getPt(endParam), 0, 0, 0);
+            }
+            
+            return sub;
         }
 
         private void PickAngle()
@@ -125,8 +195,8 @@ namespace Lots_Subdivision
         private void ExecuteSubdivision(SubdivisionWindow.SubdivisionData data)
         {
             var state = GetCurrentState();
-            if (state.ParentId.IsNull || state.FrontageLine == null) {
-                Application.ShowAlertDialog("Select Parent and Frontage first.");
+            if (state.ParentId.IsNull || state.ParentId.IsErased || state.FrontagePath == null) {
+                Application.ShowAlertDialog("The parent parcel or frontage path is missing. Please select them again.");
                 return;
             }
 
@@ -139,6 +209,11 @@ namespace Lots_Subdivision
             {
                 try {
                     var parentPline = (Autodesk.AutoCAD.DatabaseServices.Polyline)tr.GetObject(state.ParentId, OpenMode.ForWrite);
+                    if (parentPline.IsErased) 
+                    {
+                        ed.WriteMessage("\nError: Parent polyline was erased.");
+                        return;
+                    }
                     var parentRegion = CreateRegionFromPolyline(parentPline);
                     if (parentRegion == null) return;
 
@@ -149,26 +224,28 @@ namespace Lots_Subdivision
                         return;
                     }
 
-                    // Robust Direction Sensing: Compare +Depth and -Depth areas
-                    Vector3d frontageDir = (state.FrontageLine.EndPoint - state.FrontageLine.StartPoint).GetNormal();
+                    // Robust Direction Sensing
+                    Vector3d frontageDir = (state.FrontagePath.EndPoint - state.FrontagePath.StartPoint).GetNormal();
                     Vector3d sideVec = frontageDir.RotateBy(data.Angle, Vector3d.ZAxis);
                     
-                    using (var regPos = CreateClippedRegion(parentRegion, state.FrontageLine, state.FrontageLine.Length, data.Depth, sideVec))
-                    using (var regNeg = CreateClippedRegion(parentRegion, state.FrontageLine, state.FrontageLine.Length, data.Depth, -sideVec))
+                    using (var regPos = CreateClippedRegion(parentRegion, state.FrontagePath, state.FrontagePath.Length, data.Depth, sideVec))
+                    using (var regNeg = CreateClippedRegion(parentRegion, state.FrontagePath, state.FrontagePath.Length, data.Depth, -sideVec))
                     {
-                        if (regNeg.Area > regPos.Area) sideVec = -sideVec;
+                        double posArea = regPos?.Area ?? 0;
+                        double negArea = regNeg?.Area ?? 0;
+                        if (negArea > posArea) sideVec = -sideVec;
                     }
 
                     Autodesk.AutoCAD.DatabaseServices.Region? resultRegion = null;
                     
-                    if (data.LockWidth) SolveForDepth(parentRegion, state.FrontageLine, data, sideVec, out resultRegion);
-                    else SolveForWidth(parentRegion, state.FrontageLine, data, sideVec, out resultRegion);
+                    if (data.LockWidth) SolveForDepth(parentRegion, state.FrontagePath, data, sideVec, ed, out resultRegion);
+                    else SolveForWidth(parentRegion, state.FrontagePath, data, sideVec, ed, out resultRegion);
 
-                    if (resultRegion != null && resultRegion.Area > 0)
+                    if (resultRegion != null && resultRegion.Area > 0.001)
                     {
-                        if (Math.Abs(resultRegion.Area - data.TargetArea) > 1.0)
+                        if (Math.Abs(resultRegion.Area - data.TargetArea) > 0.1)
                         {
-                            ed.WriteMessage($"\nWarning: Could not achieve exact target area. Achieved: {resultRegion.Area:F2}m2");
+                            ed.WriteMessage($"\nWarning: Could not achieve exact target area. Achieved: {resultRegion.Area:F2}m2 (Diff: {resultRegion.Area - data.TargetArea:F2})");
                         }
 
                         using (var lotClone = (Autodesk.AutoCAD.DatabaseServices.Region)resultRegion.Clone())
@@ -177,69 +254,136 @@ namespace Lots_Subdivision
                         UpdateParentParcel(parentPline, parentRegion, tr, db, state);
                         FinalizeLot(db, tr, resultRegion, ed);
                         ed.WriteMessage("\nSubdivision complete.");
+                        resultRegion.Dispose();
                     }
-                    else ed.WriteMessage("\nError: Could not solve within parcel boundaries.");
+                    else
+                    {
+                        ed.WriteMessage("\nError: Could not solve within parcel boundaries. The target area may be unreachable.");
+                        resultRegion?.Dispose();
+                    }
                     
                     parentRegion.Dispose();
                     tr.Commit();
                 } catch (System.Exception ex) {
-                    ed.WriteMessage("\nError: " + ex.Message);
+                    ed.WriteMessage("\nError in ExecuteSubdivision: " + ex.Message);
                     tr.Abort();
                 }
             }
         }
 
-        private void SolveForWidth(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, SubdivisionWindow.SubdivisionData data, Vector3d sideVec, out Autodesk.AutoCAD.DatabaseServices.Region? res)
+        private void SolveForWidth(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Polyline frontage, SubdivisionWindow.SubdivisionData data, Vector3d sideVec, Editor ed, out Autodesk.AutoCAD.DatabaseServices.Region? res)
         {
             double min = 0; double max = frontage.Length;
             double cur = (min + max) / 2;
             res = null;
-            for (int i = 0; i < 100; i++)
+            double tolerance = 0.0001;
+            
+            ed.WriteMessage("\n--- Starting Width Solver ---");
+            for (int i = 0; i < 50; i++)
             {
-                if (res != null) res.Dispose();
-                res = CreateClippedRegion(parent, frontage, cur, data.Depth, sideVec);
-                if (Math.Abs(res.Area - data.TargetArea) < 0.001) break;
-                if (res.Area < data.TargetArea) min = cur; else max = cur;
+                var testRes = CreateClippedRegion(parent, frontage, cur, data.Depth, sideVec);
+                double currentArea = testRes?.Area ?? 0;
+                
+                ed.WriteMessage($"\nIter {i}: Min={min:F2}, Max={max:F2}, Cur={cur:F2}, Area={currentArea:F2}");
+
+                if (testRes == null || currentArea < 0.001)
+                {
+                    testRes?.Dispose();
+                    min = cur;
+                }
+                else
+                {
+                    if (res != null) res.Dispose();
+                    res = testRes;
+                    if (Math.Abs(currentArea - data.TargetArea) < tolerance) break;
+                    if (currentArea < data.TargetArea) min = cur; else max = cur;
+                }
                 cur = (min + max) / 2;
+                if (Math.Abs(max - min) < 1e-8) break;
             }
         }
 
-        private void SolveForDepth(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, SubdivisionWindow.SubdivisionData data, Vector3d sideVec, out Autodesk.AutoCAD.DatabaseServices.Region? res)
+        private void SolveForDepth(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Polyline frontage, SubdivisionWindow.SubdivisionData data, Vector3d sideVec, Editor ed, out Autodesk.AutoCAD.DatabaseServices.Region? res)
         {
-            double min = 0; double max = parent.GeometricExtents.MaxPoint.DistanceTo(parent.GeometricExtents.MinPoint) * 5;
+            Extents3d ext = parent.GeometricExtents;
+            double maxDepth = ext.MinPoint.DistanceTo(ext.MaxPoint) * 5.0;
+            double min = 0; double max = maxDepth;
             double cur = (min + max) / 2;
             res = null;
-            for (int i = 0; i < 100; i++)
+            double tolerance = 0.0001;
+            
+            ed.WriteMessage("\n--- Starting Depth Solver ---");
+            for (int i = 0; i < 50; i++)
             {
-                if (res != null) res.Dispose();
-                res = CreateClippedRegion(parent, frontage, data.Width, cur, sideVec);
-                if (Math.Abs(res.Area - data.TargetArea) < 0.001) break;
-                if (res.Area < data.TargetArea) min = cur; else max = cur;
+                var testRes = CreateClippedRegion(parent, frontage, frontage.Length, cur, sideVec);
+                double currentArea = testRes?.Area ?? 0;
+
+                ed.WriteMessage($"\nIter {i}: Min={min:F2}, Max={max:F2}, Cur={cur:F2}, Area={currentArea:F2}");
+
+                if (testRes == null || currentArea < 0.001)
+                {
+                    testRes?.Dispose();
+                    min = cur;
+                }
+                else
+                {
+                    if (res != null) res.Dispose();
+                    res = testRes;
+                    if (Math.Abs(currentArea - data.TargetArea) < tolerance) break;
+                    if (currentArea < data.TargetArea) min = cur; else max = cur;
+                }
                 cur = (min + max) / 2;
+                if (Math.Abs(max - min) < 1e-8) break;
             }
         }
 
-        private Autodesk.AutoCAD.DatabaseServices.Region CreateClippedRegion(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Line frontage, double w, double d, Vector3d side)
+        private Autodesk.AutoCAD.DatabaseServices.Region? CreateClippedRegion(Autodesk.AutoCAD.DatabaseServices.Region parent, Autodesk.AutoCAD.DatabaseServices.Polyline frontage, double w, double d, Vector3d side)
         {
-            Point3d p1 = frontage.StartPoint;
-            Point3d p2 = p1 + (frontage.EndPoint - p1).GetNormal() * w;
-            Point3d p3 = p2 + (side * d);
-            Point3d p4 = p1 + (side * d);
-
-            using (var box = new Autodesk.AutoCAD.DatabaseServices.Polyline(4))
+            using (var partialFrontage = ExtractFrontageOfWidth(frontage, w))
             {
-                box.AddVertexAt(0, new Point2d(p1.X, p1.Y), 0, 0, 0);
-                box.AddVertexAt(1, new Point2d(p2.X, p2.Y), 0, 0, 0);
-                box.AddVertexAt(2, new Point2d(p3.X, p3.Y), 0, 0, 0);
-                box.AddVertexAt(3, new Point2d(p4.X, p4.Y), 0, 0, 0);
-                box.Closed = true;
-                using (var br = CreateRegionFromPolyline(box))
+                if (partialFrontage == null) return null;
+
+                using (var box = new Autodesk.AutoCAD.DatabaseServices.Polyline())
                 {
-                    Autodesk.AutoCAD.DatabaseServices.Region res = (Autodesk.AutoCAD.DatabaseServices.Region)parent.Clone();
-                    if (br != null) { res.BooleanOperation(BooleanOperationType.BoolIntersect, br); br.Dispose(); }
-                    return res;
+                    int n = partialFrontage.NumberOfVertices;
+                    int v = 0;
+
+                    // Side 1: Forward along the frontage
+                    for (int i = 0; i < n; i++)
+                    {
+                        box.AddVertexAt(v++, partialFrontage.GetPoint2dAt(i), partialFrontage.GetBulgeAt(i), 0, 0);
+                    }
+
+                    // Side 2 & 3: Backward along the offset frontage
+                    Vector2d offset = new Vector2d(side.X * d, side.Y * d);
+                    for (int i = n - 1; i >= 0; i--)
+                    {
+                        // Invert bulges for the backward path
+                        double b = (i == 0) ? 0 : -partialFrontage.GetBulgeAt(i - 1);
+                        box.AddVertexAt(v++, partialFrontage.GetPoint2dAt(i) + offset, b, 0, 0);
+                    }
+
+                    box.Closed = true;
+
+                    using (var br = CreateRegionFromPolyline(box))
+                    {
+                        if (br == null) return null;
+                        
+                        Autodesk.AutoCAD.DatabaseServices.Region res = (Autodesk.AutoCAD.DatabaseServices.Region)parent.Clone();
+                        res.BooleanOperation(BooleanOperationType.BoolIntersect, br);
+                        br.Dispose();
+                        return res;
+                    }
                 }
             }
+        }
+
+        private Autodesk.AutoCAD.DatabaseServices.Polyline ExtractFrontageOfWidth(Autodesk.AutoCAD.DatabaseServices.Polyline frontage, double w)
+        {
+            if (w >= frontage.Length - 0.001) return (Autodesk.AutoCAD.DatabaseServices.Polyline)frontage.Clone();
+            
+            double endParam = frontage.GetParameterAtDistance(w);
+            return ExtractSubPolyline(frontage, 0, endParam);
         }
 
         private void UpdateParentParcel(Autodesk.AutoCAD.DatabaseServices.Polyline oldPline, Autodesk.AutoCAD.DatabaseServices.Region remaining, Transaction tr, Database db, SubdivisionState state)
@@ -259,6 +403,7 @@ namespace Lots_Subdivision
 
         private void FinalizeLot(Database db, Transaction tr, Autodesk.AutoCAD.DatabaseServices.Region region, Editor ed)
         {
+            double preciseArea = region.Area;
             Autodesk.AutoCAD.DatabaseServices.Polyline lotPline = RegionToPolyline(region);
             if (lotPline == null) return;
 
@@ -268,42 +413,93 @@ namespace Lots_Subdivision
             btr.AppendEntity(lotPline);
             tr.AddNewlyCreatedDBObject(lotPline, true);
             
-            AddSurveyLabels(db, tr, btr, lotPline);
+            AddSurveyLabels(db, tr, btr, lotPline, preciseArea);
         }
 
         private Autodesk.AutoCAD.DatabaseServices.Polyline RegionToPolyline(Autodesk.AutoCAD.DatabaseServices.Region region)
         {
-            using (DBObjectCollection curves = new DBObjectCollection())
+            using (DBObjectCollection exploded = new DBObjectCollection())
             {
-                region.Explode(curves);
-                if (curves.Count == 0) return null!;
-                
-                Autodesk.AutoCAD.DatabaseServices.Polyline pline = new Autodesk.AutoCAD.DatabaseServices.Polyline();
-                int v = 0;
-                // Simple vertex collection - assumes ordered curves from Explode
-                foreach (DBObject obj in curves)
+                region.Explode(exploded);
+                if (exploded.Count == 0) return null!;
+
+                List<Curve> curves = new List<Curve>();
+                foreach (DBObject obj in exploded)
                 {
-                    if (obj is Curve curve)
-                    {
-                        pline.AddVertexAt(v++, new Point2d(curve.StartPoint.X, curve.StartPoint.Y), 0, 0, 0);
-                    }
-                    obj.Dispose();
+                    if (obj is Curve curve) curves.Add(curve);
+                    else obj.Dispose();
                 }
-                pline.Closed = true;
+
+                if (curves.Count == 0) return null!;
+
+                Autodesk.AutoCAD.DatabaseServices.Polyline pline = new Autodesk.AutoCAD.DatabaseServices.Polyline();
+                double tolerance = 0.001;
+
+                // Simple daisy-chain logic for a single loop
+                Curve first = curves[0];
+                Point3d currentPt = first.StartPoint;
+                Point3d nextPt = first.EndPoint;
+                
+                pline.AddVertexAt(0, new Point2d(currentPt.X, currentPt.Y), GetBulge(first, false), 0, 0);
+                curves.RemoveAt(0);
+
+                int v = 1;
+                while (curves.Count > 0)
+                {
+                    bool found = false;
+                    for (int i = 0; i < curves.Count; i++)
+                    {
+                        Curve c = curves[i];
+                        if (c.StartPoint.DistanceTo(nextPt) < tolerance)
+                        {
+                            pline.AddVertexAt(v++, new Point2d(c.StartPoint.X, c.StartPoint.Y), GetBulge(c, false), 0, 0);
+                            nextPt = c.EndPoint;
+                            curves.RemoveAt(i);
+                            found = true;
+                            break;
+                        }
+                        else if (c.EndPoint.DistanceTo(nextPt) < tolerance)
+                        {
+                            pline.AddVertexAt(v++, new Point2d(c.EndPoint.X, c.EndPoint.Y), GetBulge(c, true), 0, 0);
+                            nextPt = c.StartPoint;
+                            curves.RemoveAt(i);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) break; // Should probably handle multiple loops, but for a simple lot this is usually enough
+                }
+
+                foreach (Curve c in curves) c.Dispose();
+                foreach (DBObject obj in exploded) if (!obj.IsDisposed) obj.Dispose();
+
+                if (pline.NumberOfVertices > 0) pline.Closed = true;
                 return pline;
             }
         }
 
-        private void AddSurveyLabels(Database db, Transaction tr, BlockTableRecord btr, Autodesk.AutoCAD.DatabaseServices.Polyline pline)
+        private double GetBulge(Curve curve, bool reverse)
+        {
+            if (curve is Arc arc)
+            {
+                double angle = arc.EndAngle - arc.StartAngle;
+                if (angle < 0) angle += 2 * Math.PI;
+                double bulge = Math.Tan(angle / 4.0);
+                return reverse ? -bulge : bulge;
+            }
+            return 0;
+        }
+
+        private void AddSurveyLabels(Database db, Transaction tr, BlockTableRecord btr, Autodesk.AutoCAD.DatabaseServices.Polyline pline, double preciseArea)
         {
             string textLayer = GetOrCreateLayer(db, tr, "PROPOSED_TEXT", Color.FromColorIndex(ColorMethod.ByAci, 2));
-            
+
             // Area Label
             Extents3d ext = pline.GeometricExtents;
             Point3d centroid = new Point3d((ext.MinPoint.X + ext.MaxPoint.X) / 2, (ext.MinPoint.Y + ext.MaxPoint.Y) / 2, 0);
             using (MText areaText = new MText())
             {
-                areaText.Contents = $"Area: {pline.Area:F2} m2";
+                areaText.Contents = $"Area: {preciseArea:F2} m2";
                 areaText.Location = centroid;
                 areaText.Height = 1.0; areaText.Layer = textLayer;
                 btr.AppendEntity(areaText);
